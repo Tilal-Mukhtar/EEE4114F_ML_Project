@@ -1,46 +1,49 @@
-"""
-File: classifier.py
-Author: Tilal Zaheer Mukhtar
-Date: 14/04/2024
-Description: The implementation of a feedforward ANN that can classify handwritten digits from the MNIST10 dataset
-"""
+import matplotlib.pyplot as plt
+import numpy as np
 import os
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.model_selection import KFold
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, Subset, TensorDataset
 
 
-# Define the feedforward ANN model
-class ArtificialNeuralNetwork(nn.Sequential):
-    def __init__(self, input_size, hidden_size, output_size, dropout=0):
+# Define the CNN image classification model
+class CNN(nn.Sequential):
+    def __init__(self, num_classes, dropout_rate=0):
         super().__init__(
-            nn.Dropout(dropout),
-            nn.Linear(input_size, hidden_size),
+            nn.Dropout(dropout_rate),
+            nn.Conv2d(1, 24, 5),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, hidden_size),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(24, 64, 5),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, output_size),
+            nn.MaxPool2d(2, 2),
+            nn.Flatten(),
+            nn.Linear(1024, num_classes),
             nn.Softmax(dim=1)
         )
 
 
-# Calculate the loss and accuracy of the ANN model for the given dataset
-def get_model_performance(model, loss_function, dataset):
-    # Apply the model to the dataset
-    images, labels = dataset[:]
-    outputs = model(images)
+# Evaluate the loss and accuracy of the model across the given dataset using the given loss function
+def evaluate(model, data_loader, criterion):
+    model.eval()
+    correct = 0
+    total = 0
+    running_loss = 0.0
+    with torch.no_grad():
+        for data in data_loader:
+            inputs, labels = data
+            outputs = model(inputs.unsqueeze(1))
+            loss = criterion(outputs, labels)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
 
-    # Calculate the loss
-    loss = loss_function(outputs, labels)
+            running_loss += loss.item()
 
-    # Calculate the accuracy
-    predicted = torch.argmax(torch.round(outputs), dim=1)
-    total = labels.size(0)
-    correct = (predicted == labels).sum()
-    accuracy = 100 * correct / total
-
-    return loss, accuracy
+    # Return mean loss, accuracy
+    return running_loss / len(data_loader), 100 * correct / total
 
 
 # Main function
@@ -48,110 +51,182 @@ def main():
     # Check for available cuda device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Define the input and output sizes of the feedforward ANN model
-    inputSize = 56*56
-    outputSize = 8
+    # Define the classification classes
+    num_classes = 6
+    classes = ["circle",  "hexagon", "lightning", "square", "star", "triangle"]
 
-    # Define the hyperparameters of the feedforward ANN model
-    hiddenSize = 1000
-    epochs = 100
-    batchSize = 16
-    learningRate = 0.001
-    dropout = 0.5
-    earlyStop = 10
-
-    # Define the classification model, loss function, and optimization algorithm
-    model = ArtificialNeuralNetwork(
-        inputSize, hiddenSize, outputSize, dropout).to(device)
-    lossFunction = nn.CrossEntropyLoss().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learningRate)
+    # Define the hyperparameters for training the CNN model
+    num_folds = 4
+    max_epochs = 20
+    batch_size = 64
+    learning_rate = 0.001
+    dropout_rate = 0.2
 
     # Create datasets
     print("Loading the dataset...")
     directory = os.path.join(".", "dataset", "processed")
-    trainDataset = torch.load(os.path.join(directory, "train.pt"))
-    valDataset = torch.load(os.path.join(directory, "val.pt"))
-    testDataset = torch.load(os.path.join(directory, "test.pt"))
-    trainDataset = torch.utils.data.TensorDataset(
-        trainDataset[0].to(device).float(), trainDataset[1].to(device))
-    valDataset = torch.utils.data.TensorDataset(
-        valDataset[0].to(device).float(), valDataset[1].to(device))
-    testDataset = torch.utils.data.TensorDataset(
-        testDataset[0].to(device).float(), testDataset[1].to(device))
-    print("Training Dataset Size:   {}".format(len(trainDataset)))
-    print("Validation Dataset Size: {}".format(len(valDataset)))
-    print("Testing Dataset Size:    {}".format(len(testDataset)))
+
+    train_dataset = torch.load(os.path.join(directory, "train.pt"))
+    test_dataset = torch.load(os.path.join(directory, "test.pt"))
+
+    train_dataset = TensorDataset(
+        train_dataset[0].to(device).float(), train_dataset[1].to(device))
+    test_dataset = TensorDataset(
+        test_dataset[0].to(device).float(), test_dataset[1].to(device))
+
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False)
+
+    print("Training Dataset Size:   {}".format(len(train_dataset)))
+    print("Testing Dataset Size:    {}".format(len(test_dataset)))
     print()
 
-    # Create dataloaders
-    trainLoader = torch.utils.data.DataLoader(
-        dataset=trainDataset, batch_size=batchSize, shuffle=True)
+    # Initialize the k-fold cross validation
+    k_fold = KFold(n_splits=num_folds, shuffle=True)
 
-    # Train the ANN model
+    # Store the average training and validation history accross all folds
+    k_fold_history = {'train_loss': [], 'val_loss': [],
+                      'train_accuracy': [], 'val_accuracy': []}
+
+    # Loop through each fold
     print("Training the model...")
-    steps = len(trainLoader)
-    stopCounter = 0
-    for epoch in range(epochs):
-        for step, (images, labels) in enumerate(trainLoader):
-            # Forward pass
-            outputs = model(images)
-            loss = lossFunction(outputs, labels)
-            optimizer.zero_grad()
+    for fold, (train_indices, val_indices) in enumerate(k_fold.split(train_dataset)):
+        # Define the data loaders for the current fold
+        fold_train_dataset = Subset(
+            train_dataset, train_indices)
+        fold_val_dataset = Subset(train_dataset, val_indices)
+        train_loader = DataLoader(
+            dataset=fold_train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(dataset=fold_val_dataset,
+                                batch_size=batch_size, shuffle=False)
 
-            # Backpropogate the loss
-            loss.backward()
+        # Define the classification model, loss function, and optimization algorithm
+        model = CNN(num_classes, dropout_rate).to(device)
+        criterion = nn.CrossEntropyLoss().to(device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-            # Update model weights
-            optimizer.step()
+        # Store the training and validation history for the current fold
+        history = {'train_loss': [], 'val_loss': [],
+                   'train_accuracy': [], 'val_accuracy': []}
 
-            # Display current training loss
-            if (step+1) % 50 == 0:
-                print("Epoch: [{}/{}], Step: [{:3d}/{}], Training Batch Loss: {:.4f}".format(
-                    epoch+1, epochs, step+1, steps, loss.item()))
+        # Train the model on the current fold
+        steps = len(train_loader)
+        for epoch in range(max_epochs):
+            running_loss = 0.0
+            for step, (images, labels) in enumerate(train_loader):
+                model.train()
 
-        # Store previous validation loss
-        if epoch > 0:
-            prev_val_loss = val_loss
+                # Forward pass
+                outputs = model(images.unsqueeze(1))
+                loss = criterion(outputs, labels)
+                optimizer.zero_grad()
 
-        # Compare the loss and accuracy for the training and validation datasets
-        with torch.no_grad():
-            model.eval()  # Turn off the dropout for validation
-            train_loss, train_accuracy = get_model_performance(
-                model, lossFunction, trainDataset)
-            val_loss, val_accuracy = get_model_performance(
-                model, lossFunction, valDataset)
-            model.train()
+                # Backpropogate the loss
+                loss.backward()
 
-        # Print the training and validation loss and accuracy
-        print()
-        print("Epoch:               [{}/{}]".format(epoch+1, epochs))
-        print("Training Loss:       {:.4f}".format(train_loss.item()))
-        print("Validation Loss:     {:.4f}".format(val_loss.item()))
-        print("Training Accuracy:   {:.2f} %".format(train_accuracy))
-        print("Validation Accuracy: {:.2f} %".format(val_accuracy))
-        print()
+                # Update model weights
+                optimizer.step()
 
-        # Increment early stopping counter if the validation loss has not decreased
-        if epoch > 0 and val_loss.item() >= prev_val_loss.item():
-            stopCounter += 1
-        # Reset the early stopping counter if the validation loss has decreased
+                # Display the results at every 100 mini-batches
+                running_loss += loss.item()
+                if (step % 100) == 99:
+                    # Get the training loss over the current mini-batch
+                    train_loss = running_loss / 100
+                    history['train_loss'].append(train_loss)
+                    running_loss = 0.0
+
+                    # Get the training accuracy over the current mini-batch
+                    _, predicted = torch.max(outputs.data, 1)
+                    correct = (predicted == labels).sum().item()
+                    train_accuracy = 100 * correct / labels.size(0)
+                    history['train_accuracy'].append(train_accuracy)
+
+                    # Evaluate the CNN model on the validation dataset
+                    val_loss, val_accuracy = evaluate(
+                        model, val_loader, criterion)
+                    history['val_loss'].append(val_loss)
+                    history['val_accuracy'].append(val_accuracy)
+
+                    # Print the training and validation loss and accuracy
+                    print(
+                        "Fold:                [{}/{}]".format(fold+1, num_folds))
+                    print(
+                        "Epoch:               [{}/{}]".format(epoch+1, max_epochs))
+                    print("Mini-Batch:          [{}/{}]".format(step+1, steps))
+                    print("Training Loss:       {:.4f}".format(train_loss))
+                    print("Validation Loss:     {:.4f}".format(val_loss))
+                    print("Training Accuracy:   {:.2f} %".format(
+                        train_accuracy))
+                    print("Validation Accuracy: {:.2f} %".format(val_accuracy))
+                    print()
+
+        # Update the training and validation history over all folds
+        if (len(k_fold_history["train_loss"]) == 0):
+            k_fold_history["train_loss"] = history["train_loss"]
+            k_fold_history["val_loss"] = history["val_loss"]
+            k_fold_history["train_accuracy"] = history["train_accuracy"]
+            k_fold_history["val_accuracy"] = history["val_accuracy"]
         else:
-            stopCounter = 0
-        # Check if the validation loss has not decreased for specified number of consecutive epochs
-        if stopCounter == earlyStop:
-            break
+            k_fold_history["train_loss"] = np.sum(
+                [history["train_loss"], k_fold_history["train_loss"]], axis=0)
+            k_fold_history["val_loss"] = np.sum(
+                [history["val_loss"], k_fold_history["val_loss"]], axis=0)
+            k_fold_history["train_accuracy"] = np.sum(
+                [history["train_accuracy"], k_fold_history["train_accuracy"]], axis=0)
+            k_fold_history["val_accuracy"] = np.sum(
+                [history["val_accuracy"], k_fold_history["val_accuracy"]], axis=0)
 
-    # Test the feedforward ANN model
+    # Average the training and validation history over all folds
+    k_fold_history["train_loss"] = np.array(
+        k_fold_history["train_loss"])/num_folds
+    k_fold_history["val_loss"] = np.array(k_fold_history["val_loss"])/num_folds
+    k_fold_history["train_accuracy"] = np.array(
+        k_fold_history["train_accuracy"])/num_folds
+    k_fold_history["val_accuracy"] = np.array(
+        k_fold_history["val_accuracy"])/num_folds
+
+    # Print the final training and validation loss and accuracy values
+    print("Final Training Loss:       {:.4f}".format(
+        k_fold_history["train_loss"][-1]))
+    print("Final Validation Loss:     {:.4f}".format(
+        k_fold_history["val_loss"][-1]))
+    print("Final Training Accuracy:   {:.2f} %".format(
+        k_fold_history["train_accuracy"][-1]))
+    print("Final Validation Accuracy: {:.2f} %".format(
+        k_fold_history["val_accuracy"][-1]))
+    print()
+
+    # Plot the average training and validation losses over all folds
+    plt.plot(k_fold_history['train_loss'], label='Training Loss')
+    plt.plot(k_fold_history['val_loss'], label='Validation Loss')
+    plt.legend()
+    plt.xlabel("Logging Iterations")
+    plt.ylabel("Cross-Entropy Loss")
+    plt.show()
+
+    # Plot the average training and validation accuracies over all folds
+    plt.plot(k_fold_history['train_accuracy'], label='Training Accuracy')
+    plt.plot(k_fold_history['val_accuracy'], label='Validation Accuracy')
+    plt.legend()
+    plt.xlabel("Logging Iterations")
+    plt.ylabel("Accuracy (%)")
+    plt.show()
+
+    # Evaluate the CNN model on the test set
     print("Testing the model...")
-    model.eval()
-    with torch.no_grad():
-        test_loss, test_accuracy = get_model_performance(
-            model, lossFunction, testDataset)
+    test_loss, test_accuracy = evaluate(model, test_loader, criterion)
     print("Testing Loss:     {:.4f}".format(test_loss))
     print("Testing Accuracy: {:.2f} %".format(test_accuracy))
     print()
 
-    # Save model
+    # Plot the confusion matrix of the results for the test set
+    images, labels = test_dataset[:]
+    predicted = torch.argmax(torch.round(model(images.unsqueeze(1))), dim=1)
+    conf_matrix = confusion_matrix(labels.cpu(), predicted.cpu())
+    ConfusionMatrixDisplay(conf_matrix, display_labels=classes).plot()
+    plt.show()
+
+    # Save the model parameters
     torch.save(model.state_dict(), "model.pt")
     print("Done!")
 
